@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset import MyTestDataset, save_emb
-from model import BaselineModel
+from model import HSTUModel
 
 
 # ========== 基础工具 ==========
@@ -352,7 +352,7 @@ def infer():
     # 模型
     usernum, itemnum = test_dataset.usernum, test_dataset.itemnum
     feat_statistics, feat_types = test_dataset.feat_statistics, test_dataset.feature_types
-    model = BaselineModel(usernum, itemnum, feat_statistics, feat_types, args).to(args.device)
+    model = HSTUModel(usernum, itemnum, feat_statistics, feat_types, args).to(args.device)
     model.eval()
 
     # 加载 checkpoint（strict=False 兼容新增的 LayerNorm）

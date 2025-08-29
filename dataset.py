@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from tqdm import tqdm
+from datetime import datetime
 
 
 class MyDataset(torch.utils.data.Dataset):
@@ -36,6 +37,9 @@ class MyDataset(torch.utils.data.Dataset):
 
         # 特征信息
         self.feature_default_value, self.feature_types, self.feat_statistics = self._init_feat_info()
+
+        # time feature ids to transfer from user to item
+        self._time_feat_cols = ["200", "201", "203", "204"]
 
     # ---------- I/O 与多进程安全 ----------
     def _load_data_and_offsets(self):
@@ -146,22 +150,59 @@ class MyDataset(torch.utils.data.Dataset):
             t = np.random.randint(l, r)
         return t
 
+    # ---------- 时间特征 ----------
+    def _add_time_features(self, user_sequence, tau=86400):
+        ts_array = np.array([r[5] for r in user_sequence], dtype=np.int64)
+        if ts_array.size == 0:
+            return ts_array, user_sequence
+        prev_ts_array = np.r_[ts_array[0], ts_array[:-1]]
+        delta_t = ts_array - prev_ts_array
+        log_gap = np.log1p(delta_t)
+
+        dt_array = [datetime.utcfromtimestamp(ts + 8 * 3600) for ts in ts_array]
+        hours = np.array([dt.hour for dt in dt_array], dtype=np.int32)
+        weekday = np.array([dt.weekday() for dt in dt_array], dtype=np.int32)
+
+        last_ts = ts_array[-1]
+        decay_delta = last_ts - ts_array
+        time_decay = np.exp(-np.log(2) * decay_delta / tau)
+
+        new_sequence = []
+        for idx, record in enumerate(user_sequence):
+            u, i, user_feat, item_feat, action_type, ts = record
+            user_feat = user_feat or {}
+            user_feat["200"] = int(hours[idx])
+            user_feat["201"] = int(weekday[idx])
+            user_feat["203"] = float(log_gap[idx])
+            user_feat["204"] = float(time_decay[idx])
+            new_sequence.append((u, i, user_feat, item_feat, action_type, ts))
+        return ts_array, new_sequence
+
+    def _transfer_context_features(self, user_feat, item_feat, cols):
+        item_feat = {} if item_feat is None else dict(item_feat)
+        user_feat = user_feat or {}
+        for col in cols:
+            if col in user_feat:
+                item_feat[col] = user_feat[col]
+        return item_feat
+
     def __getitem__(self, uid):
         """
         目标：把 user token 永远固定在第 0 位；物品从右侧对齐。
         形成：user | PAD ... PAD | item ... item
         """
         user_sequence = self._load_user_data(uid)
+        _, user_sequence = self._add_time_features(user_sequence)
 
         # 拆分出唯一的 user 以及全体 item（保留动作）
         user_tuple = None          # (u, user_feat, 2, action_type)
-        items = []                 # [(i, item_feat, 1, action_type), ...]
+        items = []                 # [(i, item_feat, u_feat, 1, action_type), ...]
         for record_tuple in user_sequence:
             u, i, user_feat, item_feat, action_type, _ = record_tuple
             if u and user_feat:
                 user_tuple = (u, user_feat, 2, action_type)
             if i and item_feat:
-                items.append((i, item_feat, 1, action_type))
+                items.append((i, item_feat, user_feat, 1, action_type))
 
         # 预分配
         L = self.maxlen + 1
@@ -178,7 +219,7 @@ class MyDataset(torch.utils.data.Dataset):
 
         # 正集合，避免采到正样本
         ts = set()
-        for i, feat, typ, act in items:
+        for i, feat, u_feat, typ, act in items:
             if i:
                 ts.add(i)
 
@@ -192,7 +233,7 @@ class MyDataset(torch.utils.data.Dataset):
 
             # user 的下一个若是首个 item，则构造正负样本/动作
             if len(items) >= 1:
-                nxt_i, nxt_feat, nxt_type, nxt_act = items[0]
+                nxt_i, nxt_feat, nxt_u_feat, nxt_type, nxt_act = items[0]
                 nxt_feat = self.fill_missing_feat(nxt_feat, nxt_i)
                 next_token_type[0] = nxt_type  # 一定为 1
                 if nxt_act is not None:
@@ -209,16 +250,17 @@ class MyDataset(torch.utils.data.Dataset):
         # ------- 物品从右侧对齐（训练丢最后一个）-------
         idx = self.maxlen  # 最右端
         if len(items) >= 1:
-            nxt = items[-1]  # (i, feat, 1, act)
+            nxt = items[-1]  # (i, feat, u_feat, 1, act)
         else:
-            nxt = (0, {}, 1, None)
+            nxt = (0, {}, {}, 1, None)
 
         for record_tuple in reversed(items[:-1]):  # 丢弃最后一个
-            i, feat, type_, act_type = record_tuple
-            next_i, next_feat, next_type, next_act_type = nxt
+            i, feat, u_feat, type_, act_type = record_tuple
+            next_i, next_feat, next_u_feat, next_type, next_act_type = nxt
 
-            feat = self.fill_missing_feat(feat, i)
-            next_feat = self.fill_missing_feat(next_feat, next_i)
+            token_feat = self._transfer_context_features(u_feat, feat, self._time_feat_cols)
+            token_feat = self.fill_missing_feat(token_feat, i)
+            next_feat_filled = self.fill_missing_feat(next_feat, next_i)
 
             # 写入右端；保留 index=0 给 user
             if idx <= 0:
@@ -229,16 +271,16 @@ class MyDataset(torch.utils.data.Dataset):
             next_token_type[idx] = next_type
             if next_act_type is not None:
                 next_action_type[idx] = next_act_type
-            seq_feat[idx] = feat
+            seq_feat[idx] = token_feat
 
             if next_type == 1 and next_i != 0:
                 pos[idx] = next_i
-                pos_feat[idx] = next_feat
+                pos_feat[idx] = next_feat_filled
                 neg_id = self._random_neq(1, self.itemnum + 1, ts)
                 neg[idx] = neg_id
                 neg_feat[idx] = self.fill_missing_feat(self.item_feat_dict[str(neg_id)], neg_id)
 
-            nxt = record_tuple
+            nxt = (i, feat, u_feat, type_, act_type)
             idx -= 1
 
         # None → 默认值
@@ -277,8 +319,8 @@ class MyDataset(torch.utils.data.Dataset):
             "item_array": [],
             "user_array": ["106", "107", "108", "110"],
             "item_emb": self.mm_emb_ids,
-            "user_continual": [],
-            "item_continual": [],
+            "user_continual": ["200", "201", "203", "204"],
+            "item_continual": ["200", "201", "203", "204"],
         }
 
         for fid in feat_types["user_sparse"]:
@@ -467,10 +509,11 @@ class MyTestDataset(MyDataset):
 
     def __getitem__(self, uid):
         user_sequence = self._load_user_data(uid)
+        _, user_sequence = self._add_time_features(user_sequence)
 
         # 拆分 user + items（推理不需要动作，但保留以兼容处理）
         user_tuple = None          # (u_reid, user_feat, 2)
-        items = []                 # [(i_reid, item_feat, 1), ...]
+        items = []                 # [(i_reid, item_feat, user_feat, 1), ...]
         user_id = None
 
         for record_tuple in user_sequence:
@@ -490,7 +533,7 @@ class MyTestDataset(MyDataset):
             if i and item_feat:
                 i_reid = 0 if (i > self.itemnum) else i
                 item_feat = self._process_cold_start_feat(item_feat) if item_feat else {}
-                items.append((i_reid, item_feat, 1))
+                items.append((i_reid, item_feat, user_feat, 1))
 
         # 预分配（完整序列，不丢最后一个）
         L = self.maxlen + 1
@@ -510,9 +553,10 @@ class MyTestDataset(MyDataset):
 
         # 物品从右对齐（不丢最后一个）
         idx = self.maxlen
-        for i_reid, feat, _ in reversed(items):
+        for i_reid, feat, u_feat, _ in reversed(items):
             if idx <= 0:
                 break
+            feat = self._transfer_context_features(u_feat, feat, self._time_feat_cols)
             feat = self.fill_missing_feat(feat, i_reid)
             seq[idx] = i_reid
             token_type[idx] = 1

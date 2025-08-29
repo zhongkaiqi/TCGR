@@ -14,7 +14,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from dataset import MyDataset
-from model import BaselineModel
+from model import HSTUModel
 
 
 def get_args():
@@ -290,7 +290,7 @@ if __name__ == '__main__':
     # 模型
     usernum, itemnum = dataset.usernum, dataset.itemnum
     feat_statistics, feat_types = dataset.feat_statistics, dataset.feature_types
-    model = BaselineModel(usernum, itemnum, feat_statistics, feat_types, args).to(args.device)
+    model = HSTUModel(usernum, itemnum, feat_statistics, feat_types, args).to(args.device)
 
     # 把温度/写日志句柄挂到 model 上，供 compute_infonce_loss 读取（不改函数体）
     model.temp = args.temperature
